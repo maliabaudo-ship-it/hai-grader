@@ -47,11 +47,7 @@ Use the actual file name from the Drive metadata (file.name). If a filename cont
 ### 5. Run the grader
 Once all files are saved, run:
 ```bash
-python3 ./hai_grader.py --local-dir /tmp/hai_drive_session
-```
-If the user is not in the project directory, use the full path:
-```bash
-python3 /path/to/hai-grader/hai_grader.py --local-dir /tmp/hai_drive_session
+python3 /Users/malia.baudo/hai-grader/hai_grader.py --local-dir /tmp/hai_drive_session
 ```
 
 ### 6. Present results
