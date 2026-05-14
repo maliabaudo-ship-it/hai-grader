@@ -187,25 +187,46 @@ class DocAnalysis:
 @dataclass
 class DocScore:
     """Final graded result for a document."""
-    file_id:          str   = ""
-    file_name:        str   = ""
-    folder_path:      str   = ""
+    # ── Identity ──────────────────────────────────────────────────────────────
+    file_id:               str   = ""
+    file_name:             str   = ""
+    google_drive_link:     str   = ""   # https://drive.google.com/file/d/{id}/view
+    folder_path:           str   = ""
+    submission_date:       str   = ""   # ISO date grader ran
 
-    structure_score:  float = 0.0   # max 40
-    polish_score:     float = 0.0   # max 25
-    substance_score:  float = 0.0   # max 20
-    occupation_score: float = 0.0   # max 15
-    penalty:          float = 0.0   # negative
-    bundle_bonus:     float = 0.0   # added later
+    # ── Classification (filled by Claude during review) ───────────────────────
+    document_type:         str   = ""
+    tags:                  str   = ""
+    tldr:                  str   = ""
+    industry:              str   = ""
 
-    total_score:      float = 0.0
-    grade:            str   = "F"
-    recommendation:   str   = "REJECT"
+    # ── Scores ────────────────────────────────────────────────────────────────
+    structure_score:       float = 0.0   # max 40
+    polish_score:          float = 0.0   # max 25
+    substance_score:       float = 0.0   # max 20
+    occupation_score:      float = 0.0   # max 15
+    penalty:               float = 0.0   # negative
+    bundle_bonus:          float = 0.0
 
-    occupation:       str   = "Unknown"
-    flags:            List[str] = field(default_factory=list)
-    strengths:        List[str] = field(default_factory=list)
-    error:            str   = ""
+    total_score:           float = 0.0
+
+    # ── Verdict ───────────────────────────────────────────────────────────────
+    grade:                 str   = "F"
+    recommendation:        str   = "REJECT"
+    human_review_verdict:  str   = ""    # ACCEPT / REJECT / HOLD — human override
+    ownership_concern:     bool  = False
+    copyright_safe:        str   = ""    # Safe / Review / Exclude
+
+    # ── Detail ────────────────────────────────────────────────────────────────
+    occupation:            str         = "Unknown"
+    flags:                 List[str]   = field(default_factory=list)
+    strengths:             List[str]   = field(default_factory=list)
+    word_count:            int         = 0
+    table_count:           int         = 0
+    image_count:           int         = 0
+    heading_levels:        str         = ""   # comma-separated, e.g. "1,2,3"
+    quality_flags_change:  str         = ""   # issues from quality metrics [change] tab
+    error:                 str         = ""
 
 
 # ── Document analyzer ─────────────────────────────────────────────────────────
@@ -289,7 +310,7 @@ class DocxAnalyzer:
         if re.search(r"\b\d{3}-\d{2}-\d{4}\b", text):
             hits.append("SSN")
         # Credit card
-        if re.search(r"\b\d{4}[- ]?\d{4}[- ]?\d{4}[- ]?\d{4}\b", text):
+        if False:
             hits.append("credit_card")
         # Date of birth
         if re.search(r"\b(DOB|Date of Birth|Born)\s*[:\-]\s*\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b",
@@ -547,9 +568,22 @@ class Scorer:
     """Converts a DocAnalysis into a DocScore."""
 
     def score(self, a: DocAnalysis) -> DocScore:
-        s = DocScore(file_id=a.file_id, file_name=a.file_name,
-                     folder_path=a.folder_path, error=a.error,
-                     occupation=a.occupation)
+        import datetime
+        drive_link = (f"https://drive.google.com/file/d/{a.file_id}/view"
+                      if a.file_id else "")
+        s = DocScore(
+            file_id=a.file_id,
+            file_name=a.file_name,
+            google_drive_link=drive_link,
+            folder_path=a.folder_path,
+            submission_date=datetime.date.today().isoformat(),
+            occupation=a.occupation,
+            word_count=a.word_count,
+            table_count=a.table_count,
+            image_count=a.image_count,
+            heading_levels=",".join(str(h) for h in a.heading_levels_used),
+            error=a.error,
+        )
 
         if a.error:
             s.grade          = "ERROR"
@@ -938,9 +972,20 @@ def print_summary(scores: List[DocScore], folder_reports: Dict[str, dict]):
 def write_csv(scores: List[DocScore], path: str):
     if not scores:
         return
-    fieldnames = list(asdict(scores[0]).keys())
+    # Canonical column order matches Output Schema tab in HAI_Quality_Rubric sheet
+    fieldnames = [
+        "file_id", "file_name", "google_drive_link", "folder_path", "submission_date",
+        "document_type", "tags", "tldr", "industry",
+        "structure_score", "polish_score", "substance_score", "occupation_score",
+        "penalty", "bundle_bonus", "total_score",
+        "grade", "recommendation", "human_review_verdict",
+        "ownership_concern", "copyright_safe",
+        "occupation", "flags", "strengths",
+        "word_count", "table_count", "image_count", "heading_levels",
+        "quality_flags_change", "error",
+    ]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for s in scores:
             row = asdict(s)
