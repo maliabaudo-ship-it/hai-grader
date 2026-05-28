@@ -61,9 +61,21 @@ get_file_metadata(fileId=FOLDER_ID)
 ```
 Report the folder title back to the user.
 
-### 3. Ask the user for the local sync path
+### 3. Find the local sync path
 
-**Always ask after a Drive URL — do not try the Drive MCP's `parentId` search.** The MCP's `parentId =` query returns empty for folders inside shared drives (a known limitation, see `reference_drive_mcp_shared_drives.md`), and even for My Drive folders the local sync is faster and more reliable.
+**Try to find it silently first — only ask the user if the search is ambiguous.** The Drive MCP's `parentId =` query returns empty for folders inside shared drives (a known limitation, see `reference_drive_mcp_shared_drives.md`), so the local sync is the right path; we just want to avoid an unnecessary AskUserQuestion when the folder is in the obvious place.
+
+```bash
+FOLDER_TITLE="<title from Step 2>"
+DRIVE_ROOT="$HOME/Library/CloudStorage/GoogleDrive-malia.baudo@joinhandshake.com"
+find "$DRIVE_ROOT" -maxdepth 6 -type d -name "$FOLDER_TITLE" 2>/dev/null
+```
+
+Inspect the output:
+- **Exactly 1 path printed** and `ls "<that path>"/*.docx` returns ≥1 file: use it silently. Report `Found at <path> — using it.` to the user and continue to Step 4.
+- **0 paths**, **2+ paths**, or **0 .docx files**: fall back to AskUserQuestion below.
+
+#### Fallback: ask the user
 
 Use the `AskUserQuestion` tool with the folder title you got from Step 2:
 
@@ -141,26 +153,19 @@ done
 ```
 **Warning:** textutil conversion often strips content from legacy .doc files. After converting, check word counts before grading — if most docs are under 200 words, the conversion failed and the batch should be skipped.
 
-### 4d. Collect Drive file IDs via title search
-Per-file Drive IDs are needed for the CSV's `drive_file_id` and `google_drive_link` columns. Search by title in **batches of ~10-12 titles per query** using `or` clauses, since the `parentId` shortcut doesn't work:
+### 5. Kick off three workstreams in parallel
 
-```
-search_files(query="title = 'FILE_A.docx' or title = 'FILE_B.docx' or … or title = 'FILE_L.docx'", pageSize=20, excludeContentSnippets=true)
-```
+After Step 4, three things can run at the same time. They write to different JSON files and don't conflict. Start all three before waiting on any of them:
 
-For batches with many files (>15), spawn a sub-agent to run these searches in parallel and write results to `/tmp/hai_drive_session/drive_metadata.json`. Use this format:
-```json
-[{"id": "1abc...", "title": "FILE_A.docx", "createdTime": "...", "owner": "..."}]
-```
+- **A — Grader + AI screener** (local Python, ~30s–3min depending on doc count)
+- **B — Drive ID lookup** (sub-agent calling `search_files`, runs against the Drive MCP)
+- **C — Metadata + ownership agents** (sub-agents reading local `.docx` content)
 
-**Notes:**
-- Some Drive titles drop the `.docx` extension; if exact match fails, try `title = 'FILE_A'` (without extension).
-- If multiple matches return, prefer the file owned by the current user, then the most recently modified.
-- Use the **local filename** (with extension and any parenthesis suffix like `FILE (1).docx`) as the JSON `title` field so it matches files in `/tmp/hai_drive_session/`, even if Drive's actual title differs.
-- If a file cannot be found, leave its `id` empty — the CSV will fall back to a blank Drive link.
+Launch them in the order below — A and B as background processes/agents, then spawn the C agents and let everything run concurrently.
 
-### 5. Run AI screen and grader concurrently
-Both read the same local directory and don't conflict — start the screener in the background, then run the grader.
+#### A — Grader + AI screener
+
+Start the screener in the background, then run the grader (also accepts being put in the background; foreground is fine since B and C are agent-driven and don't compete for the bash session).
 
 ```bash
 python3 GRADER_DIR/ai_screen.py \
@@ -170,10 +175,11 @@ AI_SCREEN_PID=$!
 
 python3 GRADER_DIR/hai_grader.py \
   --local-dir /tmp/hai_drive_session \
-  --json /tmp/hai_drive_session/results.json
-
-wait $AI_SCREEN_PID
+  --json /tmp/hai_drive_session/results.json &
+GRADER_PID=$!
 ```
+
+Don't `wait` yet — spawn the sub-agents below first, then `wait $AI_SCREEN_PID $GRADER_PID` after everything is launched.
 
 The screener checks each `.docx` for:
 - **Metadata signals**: revision count of 0 or 1, created ≈ modified timestamps, generic/blank author, non-Word application in app properties
@@ -196,7 +202,8 @@ The screener does **not** hard-reject anything — final call is always human.
 
 #### Subdirectory grading:
 ```bash
-python3 GRADER_DIR/hai_grader.py --local-dir /tmp/hai_drive_session --recursive --json /tmp/hai_drive_session/results.json
+python3 GRADER_DIR/hai_grader.py --local-dir /tmp/hai_drive_session --recursive --json /tmp/hai_drive_session/results.json &
+GRADER_PID=$!
 ```
 
 #### Disabling the credit card PII false positive:
@@ -211,31 +218,193 @@ cp GRADER_DIR/hai_grader.py.bak GRADER_DIR/hai_grader.py && rm GRADER_DIR/hai_gr
 
 When reporting scores for Finance docs with credit_card flags, always add +20 to the displayed score for the true adjusted score.
 
-### 6. Spawn metadata enrichment agents
-The grader doesn't know what each doc *is* — it only scores structure/polish/substance. Claude must fill `document_type`, `tags`, `tldr`, `industry` for every row by reading the actual content.
+#### Legal "meeting notes" false positive (2026-05-27):
+The grader's meeting-note detector fires on weak signals like `attendees:`, `agenda item`, `action items`, `called to order`, `quorum` — which appear in **long Legal contracts** inside exhibits, schedules, or operational annexes. This applies a **−15 hard-reject penalty** that does not reflect a real meeting-notes document.
+
+**When grading Legal contract batches**, after the grader runs, scan results for any doc with `flags` containing `meeting notes detected`. For each one, check:
+
+- `word_count > 3000` AND `structure_score >= 12` AND `occupation == Legal` → **false positive**
+
+For each false positive:
+- Add `+15` back to the displayed score (the displayed score is what the export script writes; the true adjusted score is `displayed + 15`)
+- Note in `quality_flags_change`: `FALSE POSITIVE: 'meeting notes' flag on a contract — grader regex triggered on contract-internal language; treat as non-reject`
+- Override the recommendation: if adjusted score crosses a grade boundary (e.g. 39 → 54 → 74), re-evaluate against thresholds and update `grade` / `recommendation`
+
+Confirmed pattern: in the 5/29 Enterprise Legal batch (43 PPAs/EPC/loan docs), 4 of 4 "meeting notes" rejects were false positives — all were 4,000–25,000 word energy contracts with substantial structure. The grader does not currently have a Legal-doc exception; tracked as a code-side fix in the `hai-grader` repo.
+
+#### B — Drive ID lookup (sub-agent OR browser fallback)
+
+Per-file Drive IDs are needed for the CSV's `drive_file_id` and `google_drive_link` columns.
+
+**⚠️ Shared-drive limitation (2026-05-27):** The Drive MCP `search_files` tool cannot reach **any** file inside a shared drive — `parentId =`, `title =`, and `fullText contains` queries all return empty, even when the folder itself is accessible via `get_file_metadata`. If the source folder is in a shared drive (e.g. `[Confidential] Otter`, `[INTERNAL ONLY] Handshake AI`), **skip the sub-agent search entirely and use the browser fallback (B2) below**. Only the in-Chrome DOM extraction can retrieve IDs from a shared-drive folder.
+
+Heuristic for deciding: if the local sync path you used in Step 3 contains `/Shared drives/` or `.shortcut-targets-by-id/`, go straight to B2. Otherwise try B1 first.
+
+##### B1 — MCP title search (My Drive folders only)
+
+Spawn **one sub-agent** to run the `search_files` calls and write `/tmp/hai_drive_session/drive_metadata.json`. The sub-agent runs in parallel with A and C — don't block on it.
+
+Search by title in **batches of ~10–12 titles per query** using `or` clauses (the `parentId` shortcut doesn't work):
+
+```
+search_files(query="title = 'FILE_A.docx' or title = 'FILE_B.docx' or … or title = 'FILE_L.docx'", pageSize=20, excludeContentSnippets=true)
+```
+
+Output format (`/tmp/hai_drive_session/drive_metadata.json`):
+```json
+[{"id": "1abc...", "title": "FILE_A.docx", "createdTime": "...", "owner": "..."}]
+```
+
+**Notes for the sub-agent:**
+- Some Drive titles drop the `.docx` extension; if exact match fails, try `title = 'FILE_A'` (without extension).
+- If multiple matches return, prefer the file owned by the current user, then the most recently modified.
+- Use the **local filename** (with extension and any parenthesis suffix like `FILE (1).docx`) as the JSON `title` field so it matches files in `/tmp/hai_drive_session/`, even if Drive's actual title differs.
+- If a file cannot be found, leave its `id` empty — the CSV will fall back to a blank Drive link.
+- **If the sub-agent reports 0 matches across all queries**, fall back to B2 — this means the folder is in a shared drive.
+
+##### B2 — Browser DOM extraction fallback (shared drives)
+
+Loads the folder in Claude in Chrome and extracts IDs directly from the rendered DOM. The runtime cost is one navigation + one JS call.
+
+1. **Load Chrome tools** (if not already):
+   ```
+   ToolSearch query="select:mcp__Claude_in_Chrome__navigate,mcp__Claude_in_Chrome__javascript_tool,mcp__Claude_in_Chrome__tabs_context_mcp,mcp__Claude_in_Chrome__browser_batch"
+   ```
+
+2. **Navigate to the folder** and wait for the file list to render:
+   ```
+   tabs_context_mcp(createIfEmpty=true)   # get tabId
+   navigate(tabId, "https://drive.google.com/drive/folders/<FOLDER_ID>")
+   # wait ~4-5 seconds via browser_batch with computer:wait
+   ```
+
+3. **Extract IDs via JS and download as TSV.** The JS console output gets masked by Anthropic's base64 filter when many file IDs are concatenated, so route through a Blob download to disk:
+   ```javascript
+   (() => {
+     const rows = document.querySelectorAll('[role="row"][data-id]');
+     const lines = [];
+     for (const row of rows) {
+       const id = row.getAttribute('data-id');
+       if (!id || id.length < 20) continue;
+       let name = null;
+       for (const child of row.querySelectorAll('[aria-label]')) {
+         const lbl = child.getAttribute('aria-label');
+         const m = lbl && lbl.match(/^(.+?\.docx)/i);
+         if (m) { name = m[1]; break; }
+       }
+       if (!name) continue;
+       lines.push(id + '\t' + name);
+     }
+     const blob = new Blob([lines.join('\n')], {type: 'text/plain'});
+     const a = document.createElement('a');
+     a.href = URL.createObjectURL(blob);
+     a.download = 'drive_ids.tsv';
+     document.body.appendChild(a);
+     a.click();
+     document.body.removeChild(a);
+     return 'wrote ' + lines.length + ' rows';
+   })();
+   ```
+
+4. **Parse the downloaded TSV** into the same `drive_metadata.json` format B1 would have written:
+   ```python
+   import json, os, glob
+   # Pick the freshest drive_ids*.tsv (Chrome adds "(1)", "(2)" suffixes if the file already exists)
+   tsvs = sorted(glob.glob(os.path.expanduser('~/Downloads/drive_ids*.tsv')), key=os.path.getmtime, reverse=True)
+   src = next(t for t in tsvs if os.path.getsize(t) > 0)
+   meta = []
+   with open(src) as f:
+       for line in f:
+           parts = line.rstrip('\n').split('\t')
+           if len(parts) >= 2:
+               fid, name = parts[-2], parts[-1]   # handles both 2-col and 3-col formats
+               meta.append({"id": fid, "title": name})
+   with open('/tmp/hai_drive_session/drive_metadata.json', 'w') as f:
+       json.dump(meta, f, indent=2)
+   print(f"Wrote {len(meta)} mappings from {src}")
+   ```
+
+5. **Clean up** the downloaded TSV(s) after backfilling: `rm ~/Downloads/drive_ids*.tsv`.
+
+**Pitfalls:**
+- Don't use top-level `await` in the JS — the MCP wraps your code in a non-async function and you'll get `SyntaxError: await is only valid in async functions`.
+- If the file list is virtualized, the rows scroll out of the DOM as you scroll. For most Drive folders under ~100 files this isn't an issue; for larger folders, fire the JS without scrolling first (Drive prerenders most of the visible window).
+- Drive's `aria-label` looks like `"<filename>.docx, Labels applied, Block external sharing, 1 additional label"` — the regex `/^(.+?\.docx)/i` extracts just the filename.
+- The Chrome session must be authenticated to a Google account with read access to the shared drive.
+
+#### C — Metadata + ownership agents (sub-agents)
+
+The grader doesn't know what each doc *is* — it only scores structure/polish/substance. Sub-agents must fill `document_type`, `tags`, `tldr`, `industry`, **`ownership_concern`, and `copyright_safe`** for every row in a single pass through each document. (This used to be two passes — content classification in Step 6 and ownership review in Step 9 — but both require reading the doc, so they're merged here.)
 
 For batches >10 docs, split into batches and spawn 3 parallel sub-agents (each handling ~⅓ of the files). Each agent should:
+
 1. Read each .docx locally via `python3 -c "import zipfile, re; ..."` from `/tmp/hai_drive_session/<fname>` — **prefer local reading over Drive reading** since Drive may have different content (versioned drafts).
-2. Determine:
+2. Determine the following six fields per file:
    - **document_type**: specific label (e.g. "Investment Committee Memo", "Stock Pitch", "PRD", "Appellate Brief", "Software Design Doc") — never generic "Report"
    - **tags**: 4–8 comma-separated keywords including named entities
    - **tldr**: 1–2 sentences with named entity to distinguish from similar docs
    - **industry**: Finance / Legal / Consulting / Data Science / Software Engineering / Other
+   - **ownership_concern**: `HIGH — <reason>` / `MEDIUM — <reason>` / empty (LOW). Use the rubric below.
+   - **copyright_safe**: `yes` / `no` / `unclear`. Use the rubric below.
 3. Save to `/tmp/hai_drive_session/metadata_batchN.json` as a JSON list:
    ```json
-   [{"file_name": "...", "document_type": "...", "tags": "...", "tldr": "...", "industry": "..."}]
+   [{"file_name": "...", "document_type": "...", "tags": "...", "tldr": "...", "industry": "...", "ownership_concern": "...", "copyright_safe": "..."}]
    ```
 
-**Always spot-check the agent output against actual file content for 2-3 files** — agents occasionally swap entries between near-duplicate files (e.g. multiple docs in the same case docket). Spot-check by reading the local content yourself.
+**Ownership rubric (content-based — filename alone is not enough):**
 
-### 7. Export CSV with ownership flags
-After grading and metadata enrichment, export results to `OUTPUT_CSV`.
+*HIGH — exclude without explicit authorization:*
+- Investment committee (IC) memos with version markers (vF, v06, vBP) and real firm names
+- Deal code names tied to real PE/VC firms (e.g. "Project X — Firm Y Term Sheet")
+- CIMs (Confidential Information Memorandums) — always covered by NDA in real M&A
+- Documents with internal product/part codes (e.g. `P0042332-1-H1 Rev. 2_17092024_vKIP`) — likely proprietary corporate specs
+- Redacted investor updates ("`MT Update ... redac`") — real portfolio company communications
+- Funding agreements and MoUs with real party names
+- Real-named PE firm fund memos (e.g. Avante Capital SBIC III) and real M&A IC memos with named target companies (e.g. Rio Tinto acquisitions)
+
+*MEDIUM — flag for verification:*
+- Information memorandums (IMs) for real NGOs or companies
+- Subscription agreements and term sheets (could be templates or real contracts)
+- Signed MSA/SOW between real entities
+- Investor updates from named real startups
+- Any doc with "redac" or "confidential" in filename
+
+*LOW (leave empty) — safe to include:*
+- Documents with clearly fictional ticker symbols (e.g. RNBK, CFGS, SPCM) — synthetic/anonymized training data
+- Student investment fund memos (student-owned, low commercial risk)
+- Academic manuscripts with institutional author attribution
+- Court filings (public record)
+- Anonymized templates with placeholders like "20XX" or "Client"
+- Numbered course submission series (e.g. "19 — BUY Stock Pitch...")
+
+**Copyright rubric:**
+- `yes` — court filings (public record); clearly student-owned work; anonymized templates; docs with fictional entities
+- `no` — published law review articles indexable online; commercial research reports under copyright; identifiable corporate IP
+- `unclear` — anything where the agent can't confidently tell from content alone (the human will spot-check in Step 8)
+
+**Important guidance for the sub-agents' prompt:**
+- "Search online if the document looks suspicious" — agents should use `WebSearch` when a real-looking firm/title appears, before deciding HIGH vs MEDIUM.
+- Spot-check accuracy: agents occasionally swap entries between near-duplicate files (e.g. multiple docs in the same case docket). The orchestrator must spot-check 2–3 files in Step 8.
+
+#### Wait for everything to finish
+
+After A, B, and C are all launched, wait for them before proceeding to Step 6 (CSV export):
+
+```bash
+wait $AI_SCREEN_PID $GRADER_PID
+```
+
+Sub-agents B and C return through the Agent tool; check that `/tmp/hai_drive_session/drive_metadata.json` and `metadata_batch*.json` exist before moving on.
+
+### 6. Export CSV
+After the parallel kickoff finishes, export results to `OUTPUT_CSV`. Ownership and copyright fields come from the sub-agents' metadata JSON (Step 5C) — the filename heuristic is only a fallback for files the agents didn't cover.
 
 **Schema: exactly 43 columns in this order** (see `project_csv_schema.md` for full reference):
 `drive_file_id, file_name, submitter_name, google_drive_link, R2 Review Results, client_facing_name, migrated, document_type, tags, tldr, industry, occupation, structure_score, polish_score, substance_score, occupation_score, penalty, bundle_bonus, total_score, grade, recommendation, page_count, word_count, table_count, image_count, Slang/Informal Language, Formatting Notes, Formality Rank, ownership_concern, copyright_safe, flags, strengths, heading_levels, quality_flags_change, error, ai_check, Verdict, Creator, Last Modified By, Editing Time (min), Signals, pangram_ai_check, spelling_and_grammar`
 
 **Grader fills**: cols 1–4, 12–25, 31–35
-**Claude fills (after manual review of content)**: cols 8–11 (document_type, tags, tldr, industry), 29–30 (ownership_concern, copyright_safe), 34 (quality_flags_change), 36 (ai_check from screener)
+**Sub-agents fill (from content review in Step 5C)**: cols 8–11 (document_type, tags, tldr, industry), 29–30 (ownership_concern, copyright_safe)
+**Orchestrator fills**: 34 (quality_flags_change from sheet review), 36 (ai_check from screener)
 **Leave empty**: cols 5–7, 26–28, 37–43
 
 ```bash
@@ -289,7 +458,7 @@ if os.path.exists(ai_screen_path):
         for entry in json.load(f):
             ai_by_name[entry['file_name']] = entry
 
-# Manual metadata from sub-agents (file_name → {document_type, tags, tldr, industry})
+# Sub-agent metadata (file_name → {document_type, tags, tldr, industry, ownership_concern, copyright_safe})
 manual_meta = {}
 for batch_file in sorted(os.listdir(SESSION)):
     if batch_file.startswith('metadata_batch') and batch_file.endswith('.json'):
@@ -356,13 +525,13 @@ with open(out_csv, 'w', newline='', encoding='utf-8') as f:
         doc['submitter_name']    = fm.get('submitter_name') or parse_submitter(fname)
         doc['page_count']        = fm.get('form_page_count') or get_page_count(fname)
 
-        # Manual classification (from metadata batches)
+        # Classification + ownership/copyright (from sub-agents' content review)
         for col in ['document_type', 'tags', 'tldr', 'industry']:
             doc[col] = mm.get(col, '')
 
-        # Ownership / copyright — filename heuristic; OVERRIDE based on content review
-        doc['ownership_concern'] = ownership_flag(fname)
-        doc['copyright_safe']    = doc.get('copyright_safe', '')   # set after content review
+        # Ownership/copyright: prefer agent's content-based judgment, fall back to filename heuristic
+        doc['ownership_concern'] = mm.get('ownership_concern') or ownership_flag(fname)
+        doc['copyright_safe']    = mm.get('copyright_safe', '')
 
         # Quality flags from quality metrics [change] tab review
         doc['quality_flags_change'] = doc.get('quality_flags_change', '')
@@ -396,7 +565,7 @@ EOF
 
 If grading a new batch (not the full corpus), use a batch-suffixed filename (e.g. `hai_grading_results_delivery6.csv`) rather than overwriting the master CSV.
 
-### 8. Present results
+### 7. Present results
 Show the full grader summary output, then give a plain-English interpretation:
 - Hard REJECTs (and why)
 - BORDERLINE docs needing human review
@@ -404,34 +573,91 @@ Show the full grader summary output, then give a plain-English interpretation:
 - Patterns across the batch
 - Average score across all docs
 
-### 9. Ownership concern check (content-based)
-After grading, scan all ACCEPT and BORDERLINE docs by **reading their actual content**, not just filenames. The filename heuristic in Step 7 is a first pass — content trumps name. Search online for any suspicious docs before including them. Override the CSV's `ownership_concern` and `copyright_safe` columns based on what you find.
+### 7a. Detect parametric variants and package as prior versions
 
-**HIGH concern — exclude without explicit authorization:**
-- Investment committee (IC) memos with version markers (vF, v06, vBP) and real firm names
-- Deal code names tied to real PE/VC firms (e.g. "Project X — Firm Y Term Sheet")
-- CIMs (Confidential Information Memorandums) — always covered by NDA in real M&A
-- Documents with internal product/part codes (e.g. `P0042332-1-H1 Rev. 2_17092024_vKIP`) — likely proprietary corporate specs
-- Redacted investor updates ("`MT Update ... redac`") — real portfolio company communications
-- Funding agreements and MoUs with real party names
-- **Real-named PE firm fund memos** (e.g. Avante Capital SBIC III) and **real M&A IC memos with named target companies** (e.g. Rio Tinto acquisitions) — content-detected, never relying on filename alone
+Some batches contain multiple files that look like distinct documents but are actually **parametric variants of the same template** — e.g. a DEWA Solar EPC term sheet rendered for 100MW, 200MW, 587MW, and CSP scopes, or a SAPC residential lease in Aggregated vs Disaggregated billing variants. These files share identical body text with only a few words swapped (project size, technology, party name, billing model).
 
-**MEDIUM concern — open and verify:**
-- Information memorandums (IMs) for real NGOs or companies
-- Subscription agreements and term sheets (could be templates or real contracts)
-- Signed MSA/SOW between real entities
-- Investor updates from named real startups
-- Any doc with "redac" or "confidential" in filename
+**Don't drop variants** — package them as prior versions of a single canonical document. This preserves provenance for the customer while making the canonical version discoverable as the "current" one.
 
-**LOW concern — safe to include:**
-- Documents with clearly fictional ticker symbols (e.g. RNBK, CFGS, SPCM) — synthetic/anonymized training data
-- Student investment fund memos (student-owned, low commercial risk)
-- Academic manuscripts with institutional author attribution
-- Court filings (public record)
-- Anonymized templates with placeholders like "20XX" or "Client"
-- Numbered course submission series (e.g. "19 — BUY Stock Pitch...")
+#### Detection
+After the grader runs, look for groups where 2+ files share:
+- Filename prefix or template marker (e.g. `DEWA ... PV EPC ... REVISED 31 12 14`, `SAPC-Residential-Lease ... Version-1.0`, `PPA_*_RNW_Unknown MW_GLB`)
+- Word counts within **~100 words of each other** (or *exactly identical* — a stronger signal)
+- Identical opening 200 chars (first sentence)
 
-### 10. Write learnings back to the reference sheet
+Quick clustering script:
+```python
+import zipfile, re, os
+from collections import defaultdict
+
+def opening(fname):
+    with zipfile.ZipFile(f'/tmp/hai_drive_session/{fname}') as z:
+        xml = z.open('word/document.xml').read().decode('utf-8', errors='ignore')
+    text = re.sub(r'<[^>]+>', ' ', xml)
+    return re.sub(r'\s+', ' ', text).strip()
+
+# Cluster by opening-80-char prefix
+groups = defaultdict(list)
+for f in os.listdir('/tmp/hai_drive_session'):
+    if not f.endswith('.docx'): continue
+    text = opening(f)
+    # Use a coarse key: first 80 chars of text after stripping numbers (which often hold the swapped parameter)
+    key = re.sub(r'\d+', '#', text[:80])
+    groups[key].append((f, len(text.split())))
+
+for key, files in groups.items():
+    if len(files) >= 2:
+        wcs = [wc for _, wc in files]
+        if max(wcs) - min(wcs) < 200:   # word counts within 200 of each other
+            print(f"\nVariant group ({len(files)} files, wc range {min(wcs)}-{max(wcs)}):")
+            for f, wc in files: print(f"  {wc:>6}w  {f}")
+```
+
+#### Identifying the canonical (most recent) variant
+
+For each group, pick ONE canonical and mark the rest as `prior_version`:
+
+| Signal | What it tells you |
+|---|---|
+| Filename has version marker (`v2`, `v1.0`, `REVISED dd mm yy`) | Higher number / later date = canonical |
+| Filename has `TOP UP`, `Amended`, `Updated`, `Final` | Later than the base version |
+| Filename has `base bid` vs `Alt` | `base bid` is original scope; Alts are parallel submissions in the same bid round (chronologically tied — keep `base bid` as anchor) |
+| `Aggregated` vs `Disaggregated` billing variants | Tied — prefer the more comprehensive (longer word count) as canonical |
+| Internal dates in body (e.g. `September 30, 2011`) | Use the latest internal date |
+| docProps `created` / `modified` | Usually **unreliable** in bulk-uploaded batches (metadata stripped) — confirm before trusting |
+
+If signals are inconclusive, prefer the **most comprehensive** variant (highest word count) as canonical.
+
+#### Recording in the CSV
+
+For each non-canonical variant, append to `quality_flags_change`:
+```
+prior version — current: <canonical_file_name>
+```
+
+On the canonical row, append to `quality_flags_change`:
+```
+current version — prior versions: <comma-separated list of variant filenames>
+```
+
+When reporting to the user, surface the version groupings explicitly:
+- N files total = M unique documents + (N−M) prior-version variants
+- For each variant group: which is canonical, why
+
+#### When NOT to group as variants
+
+Documents that share filename keywords but cover **different functional contracts** are not variants — they're a deal stack. E.g. an EPC contract + PPA + O&M + LTSA + GTA for the same project (Kingline / Ondo IPP) share project name and law-firm doc-code prefix but are five distinct legal documents that together form the deal. Keep each separately; do not mark as prior versions.
+
+### 8. Spot-check ownership flags
+The Step 5C agents have already done the content-based ownership review and written `ownership_concern` / `copyright_safe` into the CSV. This step is a sanity check, not a re-do.
+
+1. Look at every row the CSV marks `HIGH` — open 2–3 of them and confirm the agent's reasoning matches the content. Agents occasionally swap entries between near-duplicate files, so verify the filename in the CSV matches the doc you opened.
+2. For any `MEDIUM` row in the ACCEPT/BORDERLINE band, decide whether to include based on the agent's `tldr` and the rubric in Step 5C. Override the CSV if you disagree.
+3. If the agent marked `copyright_safe = unclear` on a doc you want to include, run a quick `WebSearch` for the title/author/institution before deciding.
+
+The HIGH/MEDIUM/LOW rubric and copyright reference live in Step 5C and the [Copyright Quick Reference](#copyright-quick-reference) section below — don't duplicate them here.
+
+### 9. Write learnings back to the reference sheet
 After every batch, append new observations to the Google Sheet using Claude in Chrome.
 
 **Navigate to the sheet:**
@@ -454,7 +680,7 @@ Only log observations that are new or contradict existing Active rows. Do not re
 **Append to Batch Performance tab** — one row per batch:
 date, folder name/source, total doc count, accept count, borderline count, reject count, average score, notes.
 
-### 11. Clean up
+### 10. Clean up
 ```bash
 rm -rf /tmp/hai_drive_session
 ```
