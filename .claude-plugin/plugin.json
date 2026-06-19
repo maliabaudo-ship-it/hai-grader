@@ -1,0 +1,9 @@
+{
+  "name": "honeycomb-tools",
+      "version": "0.2.0",
+      "description": "Document cataloging and manifest tools for Project Honeycomb. Grades Drive folders, generates HAI naming conventions, and builds delivery manifests.",
+      "author": {
+    "name": "Malia Baudo"
+      },
+        "keywords": ["honeycomb", "manifest", "drive", "documents", "cataloging", "HAI naming"]
+      }
